@@ -7,6 +7,7 @@ export interface ServiceWorkerManager {
   update: () => Promise<void>;
   clearCache: () => Promise<boolean>;
   getCacheSize: () => Promise<number>;
+  cleanupOldVersions: () => Promise<boolean>;
 }
 
 class SWManager implements ServiceWorkerManager {
@@ -229,6 +230,28 @@ class SWManager implements ServiceWorkerManager {
     } catch (error) {
       console.error('强制更新失败:', error)
     }
+  }
+
+  /**
+   * 清理旧版本文件
+   */
+  async cleanupOldVersions(): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (!navigator.serviceWorker.controller) {
+        resolve(false)
+        return
+      }
+
+      const messageChannel = new MessageChannel()
+      messageChannel.port1.onmessage = (event) => {
+        resolve(event.data.success || false)
+      }
+
+      navigator.serviceWorker.controller.postMessage(
+        { type: 'CLEANUP_OLD_VERSIONS' },
+        [messageChannel.port2]
+      )
+    })
   }
 
   /**

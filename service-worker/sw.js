@@ -188,6 +188,9 @@ async function cacheFirst(request, cacheName) {
         headers: headers
       });
 
+      // 先清理同名文件的旧版本
+      await smartCacheCleanup(cacheName, request);
+      
       await cache.put(request, responseWithTimestamp);
       await limitCacheSize(cacheName, currentConfig.maxEntries.static);
     }
@@ -212,14 +215,58 @@ function isExpired(response) {
   return age > currentConfig.maxAge.static;
 }
 
-// 限制缓存大小
+// 提取文件基础名（去掉hash）
+function getFileBaseName(url) {
+  const pathname = new URL(url).pathname;
+  const filename = pathname.split('/').pop();
+  
+  // 匹配模式：name.hash.ext 或 name-hash.ext
+  const match = filename.match(/^(.+?)[\.\-]([a-f0-9]{6,})(\.[^.]+)$/i);
+  if (match) {
+    return match[1] + match[3]; // 返回 name.ext
+  }
+  return filename;
+}
+
+// 智能缓存清理：清理同名文件的旧版本
+async function smartCacheCleanup(cacheName, newRequest) {
+  const cache = await caches.open(cacheName);
+  const keys = await cache.keys();
+  const newBaseName = getFileBaseName(newRequest.url);
+  
+  // 找到同名文件的旧版本
+  const oldVersions = keys.filter(key => {
+    const baseName = getFileBaseName(key.url);
+    return baseName === newBaseName && key.url !== newRequest.url;
+  });
+  
+  // 删除旧版本
+  if (oldVersions.length > 0) {
+    console.log(`Cleaning up ${oldVersions.length} old versions of ${newBaseName}`);
+    await Promise.all(oldVersions.map(key => cache.delete(key)));
+  }
+}
+
+// 限制缓存大小（改进版）
 async function limitCacheSize(cacheName, maxEntries) {
   const cache = await caches.open(cacheName);
   const keys = await cache.keys();
   
   if (keys.length > maxEntries) {
-    const entriesToDelete = keys.slice(0, keys.length - maxEntries);
-    await Promise.all(entriesToDelete.map(key => cache.delete(key)));
+    // 按缓存时间排序，删除最旧的条目
+    const keysWithTime = await Promise.all(
+      keys.map(async key => {
+        const response = await cache.match(key);
+        const cachedAt = response?.headers.get('sw-cached-at') || '0';
+        return { key, time: parseInt(cachedAt) };
+      })
+    );
+    
+    keysWithTime.sort((a, b) => a.time - b.time);
+    const entriesToDelete = keysWithTime.slice(0, keys.length - maxEntries);
+    await Promise.all(entriesToDelete.map(item => cache.delete(item.key)));
+    
+    console.log(`Cleaned up ${entriesToDelete.length} old cache entries`);
   }
 }
 
@@ -263,6 +310,16 @@ self.addEventListener('message', event => {
       event.waitUntil(
         getCacheInfo().then(info => {
           event.ports[0].postMessage(info);
+        })
+      );
+      break;
+
+    case 'CLEANUP_OLD_VERSIONS':
+      event.waitUntil(
+        cleanupAllOldVersions().then(() => {
+          event.ports[0].postMessage({ success: true });
+        }).catch(error => {
+          event.ports[0].postMessage({ success: false, error: error.message });
         })
       );
       break;
@@ -326,4 +383,44 @@ async function getCacheInfo() {
     projectId: currentProjectId,
     timestamp: Date.now()
   };
+}
+
+// 清理所有旧版本文件
+async function cleanupAllOldVersions() {
+  const cacheNames = await caches.keys();
+  let cleanedCount = 0;
+  
+  for (const cacheName of cacheNames) {
+    if (cacheName.includes(`${currentProjectId}-`)) {
+      const cache = await caches.open(cacheName);
+      const keys = await cache.keys();
+      
+      // 按基础文件名分组
+      const fileGroups = {};
+      keys.forEach(key => {
+        const baseName = getFileBaseName(key.url);
+        if (!fileGroups[baseName]) {
+          fileGroups[baseName] = [];
+        }
+        fileGroups[baseName].push(key);
+      });
+      
+      // 对每组文件，只保留最新的一个
+      for (const [baseName, files] of Object.entries(fileGroups)) {
+        if (files.length > 1) {
+          // 按URL排序，保留最后一个（通常是最新的）
+          files.sort((a, b) => a.url.localeCompare(b.url));
+          const filesToDelete = files.slice(0, -1);
+          
+          await Promise.all(filesToDelete.map(key => cache.delete(key)));
+          cleanedCount += filesToDelete.length;
+          
+          console.log(`Cleaned up ${filesToDelete.length} old versions of ${baseName}`);
+        }
+      }
+    }
+  }
+  
+  console.log(`Total cleaned up ${cleanedCount} old version files`);
+  return cleanedCount;
 }
